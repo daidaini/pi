@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lesson 0001 · pi 工具执行主调用链</title>
+  <style>
+    :root { --ink:#111827; --muted:#6b7280; --line:#d1d5db; --bg:#ffffff; --soft:#f8fafc; --blue:#1d4ed8; --green:#047857; --amber:#b45309; --red:#b91c1c; --code:#0f172a; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:17px/1.62 ui-serif, Georgia, "Noto Serif SC", serif; }
+    main { max-width:960px; margin:46px auto; padding:0 24px 72px; }
+    header { margin-bottom:30px; }
+    h1 { font-size:38px; line-height:1.05; letter-spacing:-.03em; margin:0 0 10px; }
+    h2 { margin-top:40px; padding-top:18px; border-top:1px solid var(--line); font-size:24px; }
+    h3 { font-size:18px; margin-top:24px; }
+    p, li { max-width:76ch; }
+    a { color:var(--blue); text-decoration-thickness:1px; text-underline-offset:3px; }
+    code { font-family:ui-monospace, SFMono-Regular, Consolas, monospace; font-size:.92em; background:#eef2ff; color:var(--code); border-radius:4px; padding:.08em .28em; }
+    pre { overflow:auto; background:#0f172a; color:#e5e7eb; border-radius:14px; padding:16px; font-size:14px; line-height:1.45; }
+    .muted { color:var(--muted); }
+    .lede { font-size:20px; line-height:1.5; }
+    .goal { border-left:5px solid var(--blue); background:var(--soft); border-radius:12px; padding:14px 18px; }
+    .diagram { margin:24px 0; display:grid; gap:10px; }
+    .row { display:grid; grid-template-columns:1fr auto 1fr; gap:10px; align-items:center; }
+    .box { border:1px solid var(--line); border-radius:14px; padding:14px 16px; background:white; min-height:64px; }
+    .box strong { display:block; font-family:ui-sans-serif, system-ui, sans-serif; font-size:14px; margin-bottom:4px; }
+    .agent { border-left:5px solid var(--blue); }
+    .model { border-left:5px solid var(--green); }
+    .tool { border-left:5px solid var(--amber); }
+    .ui { border-left:5px solid #7c3aed; }
+    .arrow { color:var(--muted); font-family:ui-monospace, monospace; }
+    .wide { grid-column:1 / -1; }
+    .callout { border:1px solid var(--line); background:var(--soft); border-radius:14px; padding:16px 18px; margin:18px 0; }
+    .warning { border-left:5px solid var(--amber); }
+    .check { border-left:5px solid var(--green); }
+    details { border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin:12px 0; background:white; }
+    summary { cursor:pointer; font-family:ui-sans-serif, system-ui, sans-serif; font-weight:650; }
+    table { border-collapse:collapse; width:100%; margin:16px 0; font-size:15px; }
+    th, td { border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); font:700 12px/1.3 ui-sans-serif, system-ui, sans-serif; text-transform:uppercase; letter-spacing:.05em; }
+    .mini { font-size:14px; color:var(--muted); }
+    .quiz { border:1px solid var(--line); border-radius:14px; background:var(--soft); padding:16px 18px; }
+    input { font:15px ui-monospace, monospace; padding:8px 10px; border:1px solid var(--line); border-radius:8px; width:min(100%, 420px); }
+    button { font:700 14px ui-sans-serif, system-ui, sans-serif; padding:8px 12px; border-radius:8px; border:1px solid var(--blue); background:var(--blue); color:white; cursor:pointer; }
+    #feedback { margin-top:10px; font-family:ui-sans-serif, system-ui, sans-serif; }
+    @media (max-width:820px) { .row { grid-template-columns:1fr; } .arrow { text-align:center; transform:rotate(90deg); } }
+    @media print { body { font-size:12pt; } main { margin:0; max-width:none; } a { color:black; } .box, .callout, details { break-inside:avoid; } button, input { display:none; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="muted">Lesson 0001 · mission: <a href="../MISSION.md">理解 pi 项目中的工具执行，写架构文档</a> · reference: <a href="../reference/tool-execution-call-chain.html">调用链速查</a></p>
+    <h1>工具执行主调用链：模型决定，本地执行</h1>
+    <p class="lede">这节只学一件事：当你在 pi 里看到 <code>bash</code>、<code>read</code>、<code>edit</code> 等工具执行时，源码里的主路径是什么。</p>
+    <div class="goal">
+      <strong>本节完成后你应该能：</strong>
+      <ul>
+        <li>画出“用户输入 → 模型产出 toolCall → 本地执行 → toolResult 回到模型”的链路。</li>
+        <li>说清楚模型和本地 agent loop 的职责边界。</li>
+        <li>知道下一次写架构文档时应先打开哪几个文件。</li>
+      </ul>
+    </div>
+  </header>
+
+  <h2>1. 先抓住边界</h2>
+  <p><strong>模型决定要不要调用工具。</strong>本地代码不会在用户 prompt 后直接挑一个工具运行；它把 active tools 的 schema 放进 LLM 请求，然后等待 provider stream 产出 <code>ToolCall</code>。AI 层的类型把这个边界写得很清楚：<code>Context</code> 里有 <code>tools?: Tool[]</code>，assistant 内容里可以出现 <code>ToolCall</code>，执行结果再以 <code>ToolResultMessage</code> 回到消息历史（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/ai/src/types.ts#L336-L426">packages/ai/src/types.ts</a>）。</p>
+
+  <div class="callout warning">
+    <p><strong>一句话：</strong><code>Tool</code> 是“告诉模型能调用什么”；<code>AgentTool.execute()</code> 才是“本地真的怎么运行”。core agent 的 <code>AgentTool</code> 继承 AI 层 <code>Tool</code>，并增加 <code>label</code>、<code>execute</code>、<code>executionMode</code>（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/types.ts#L350-L386">packages/agent/src/types.ts</a>）。</p>
+  </div>
+
+  <h2>2. 主调用链图</h2>
+  <div class="diagram" aria-label="pi 工具执行主调用链">
+    <div class="row">
+      <div class="box agent"><strong>AgentSession</strong>构建 tool registry，选择 active tools，重建 system prompt。</div>
+      <div class="arrow">→</div>
+      <div class="box agent"><strong>Agent</strong><code>agent.prompt()</code> 进入 core agent loop。</div>
+    </div>
+    <div class="row">
+      <div class="box model"><strong>LLM request</strong><code>Context.tools</code> 带上工具 schema。</div>
+      <div class="arrow">→</div>
+      <div class="box model"><strong>Provider stream</strong>assistant message 流式出现 <code>toolCall</code>。</div>
+    </div>
+    <div class="row">
+      <div class="box tool"><strong>agent-loop</strong>assistant message 结束后，收集 <code>toolCall</code> 并执行。</div>
+      <div class="arrow">→</div>
+      <div class="box tool"><strong>Tool.execute</strong>校验参数、跑工具、发 partial update、得到 result。</div>
+    </div>
+    <div class="row">
+      <div class="box ui"><strong>Events / TUI</strong><code>tool_execution_start/update/end</code> 更新界面。</div>
+      <div class="arrow">→</div>
+      <div class="box model"><strong>Next turn</strong><code>ToolResultMessage</code> 进入上下文，模型继续回答。</div>
+    </div>
+  </div>
+
+  <h2>3. 源码导览：按这个顺序读</h2>
+
+  <h3>A. 工具从哪里来？</h3>
+  <p>内置工具入口在 <a href="../packages/coding-agent/src/core/tools/index.ts"><code>packages/coding-agent/src/core/tools/index.ts</code></a>。这里能看到 <code>read</code>、<code>bash</code>、<code>edit</code>、<code>write</code>、<code>grep</code>、<code>find</code>、<code>ls</code> 的 definitions 和 executable tools；<code>createAllToolDefinitions()</code> 是 product 层构建内置工具定义的入口（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/index.ts#L156-L164">source</a>）。</p>
+  <p><code>AgentSession._buildRuntime()</code> 会创建这些 base tool definitions，再加载 extensions，并刷新 registry（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L2400-L2448">source</a>）。<code>_refreshToolRegistry()</code> 把 built-in、extension、SDK custom tools 合并，最后 <code>setActiveToolsByName()</code> 把可用工具写进 <code>agent.state.tools</code>（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L2307-L2397">registry</a> 和 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L812-L826">active tools</a>）。</p>
+
+  <h3>B. 用户输入如何进入 loop？</h3>
+  <p><code>AgentSession.prompt()</code> 先处理 slash command、input extension、模板、鉴权、图片、<code>before_agent_start</code> 等 product 行为，然后调用 <code>_runAgentPrompt()</code>；后者调用 <code>this.agent.prompt(messages)</code>（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L947-L956">_runAgentPrompt</a> 和 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/agent-session.ts#L997-L1144">prompt</a>）。</p>
+
+  <h3>C. 工具 schema 何时给模型？</h3>
+  <p>在 core loop 的 <code>streamAssistantResponse()</code> 中，代码把 agent messages 转成 LLM messages，然后构造 <code>llmContext</code>：其中 <code>tools: context.tools</code>。这一步是“本地把工具选择权交给模型”的具体位置（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/agent-loop.ts#L275-L303">source</a>）。</p>
+
+  <h3>D. 什么时候真正执行？</h3>
+  <p>不是 <code>toolcall_delta</code> 一出现就执行。loop 等 assistant message 完成后，才过滤 <code>message.content</code> 里的 <code>toolCall</code>，调用 <code>executeToolCalls()</code>；执行结果再追加到 <code>currentContext.messages</code>（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/agent-loop.ts#L203-L214">source</a>）。</p>
+  <p>单个工具执行的核心顺序在 <code>prepareToolCall()</code> 和 <code>executePreparedToolCall()</code>：找工具、<code>prepareArguments</code>、<code>validateToolArguments</code>、<code>beforeToolCall</code>、<code>tool.execute()</code>、partial updates、错误转成 tool result（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/agent-loop.ts#L562-L655">source</a>）。执行后 <code>afterToolCall</code> 可修改结果，然后发 <code>tool_execution_end</code>，创建 <code>ToolResultMessage</code>（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/agent/src/agent-loop.ts#L682-L745">source</a>）。</p>
+
+  <h3>E. UI 为什么能显示“正在执行”？</h3>
+  <p>interactive mode 订阅 <code>AgentSessionEvent</code>。当 assistant streaming update 中出现 <code>toolCall</code> 时，TUI 可以提前创建 pending 的 <code>ToolExecutionComponent</code>；当 <code>tool_execution_start/update/end</code> 到来时，再标记开始、刷新 partial result、写入最终 result（见 <a href="https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L2792-L2907">interactive-mode.ts</a>）。单个工具行的状态和渲染在 <a href="../packages/coding-agent/src/modes/interactive/components/tool-execution.ts"><code>tool-execution.ts</code></a>。</p>
+
+  <h2>4. 你现在应该记住的最小架构</h2>
+  <pre>AgentSession: 组装工具、选 active tools、处理产品层事件
+      ↓
+Agent / agent-loop: 把 Context.tools 交给模型，接收 toolCall
+      ↓
+Tool execution: validate → before hook → execute → after hook
+      ↓
+Events: tool_execution_start/update/end 给 UI / RPC / extensions
+      ↓
+ToolResultMessage: 追加到上下文，模型下一轮读取结果</pre>
+
+  <h2>5. 2 分钟检索练习</h2>
+  <div class="quiz">
+    <p><strong>不看上面的图，填这条链路中最关键的 3 个中间名词：</strong></p>
+    <p><code>用户 prompt → </code><input id="q1" aria-label="第一个空" placeholder="?" /> <code> → </code><input id="q2" aria-label="第二个空" placeholder="?" /> <code> → </code><input id="q3" aria-label="第三个空" placeholder="?" /> <code> → toolResult → 下一轮模型</code></p>
+    <button onclick="check()">检查</button>
+    <p id="feedback"></p>
+    <p class="mini">目标答案：<code>AgentSession</code>、<code>agent-loop</code>、<code>tool.execute</code>。大小写不严格；你也可以写语义等价词。</p>
+  </div>
+
+  <details>
+    <summary>如果要写架构文档，这节可直接转成哪段？</summary>
+    <p>可写成“工具执行总览”：pi 在 session 层收集并激活工具，把工具 schema 传给模型。模型返回 assistant message，其中可能包含 tool calls。core agent loop 在 assistant message 完成后执行这些 tool calls，校验参数并经过 extension hooks，调用对应 <code>AgentTool.execute()</code>。执行结果通过事件给 UI/RPC，并作为 <code>ToolResultMessage</code> 追加进上下文，驱动下一轮模型响应。</p>
+  </details>
+
+  <details>
+    <summary>常见错点自查</summary>
+    <ul>
+      <li>如果你说“AgentSession 选择调用 bash”，不准确。AgentSession 只激活可用工具；模型输出 <code>toolCall</code>。</li>
+      <li>如果你说“toolcall_delta 到了就执行”，不准确。执行发生在 assistant message 完成后。</li>
+      <li>如果你忽略 <code>ToolResultMessage</code>，调用链就断了。工具结果必须回到下一轮模型上下文。</li>
+    </ul>
+  </details>
+
+  <h2>6. 推荐主源阅读</h2>
+  <p>先读 <a href="../packages/agent/README.md"><code>packages/agent/README.md</code></a> 的 <em>With Tool Calls</em> 事件序列；然后打开 <a href="../packages/agent/src/agent-loop.ts"><code>packages/agent/src/agent-loop.ts</code></a>，只读 <code>streamAssistantResponse()</code>、<code>executeToolCalls()</code>、<code>prepareToolCall()</code>、<code>executePreparedToolCall()</code>、<code>createToolResultMessage()</code>。</p>
+
+  <div class="callout check">
+    <p><strong>下一步建议：</strong>问我“继续 Lesson 0002：extension 的 tool_call / tool_result hook 如何插入这条链”。我会基于这张调用链继续加一层，而不是展开所有源码。</p>
+    <p>如果某个源码点不清楚，直接把函数名发给我，我会按调用链位置解释。</p>
+  </div>
+</main>
+<script>
+function norm(s) { return String(s || "").toLowerCase().replace(/[\s_.-]+/g, ""); }
+function ok(value, answers) { const v = norm(value); return answers.some(a => v.includes(norm(a)) || norm(a).includes(v)); }
+function check() {
+  const a = document.getElementById("q1").value;
+  const b = document.getElementById("q2").value;
+  const c = document.getElementById("q3").value;
+  const good = ok(a, ["AgentSession", "session"]) && ok(b, ["agent-loop", "agent loop", "Agent"]) && ok(c, ["tool.execute", "execute", "AgentTool"]);
+  const el = document.getElementById("feedback");
+  if (good) {
+    el.textContent = "正确。你抓住了 product session → core loop → executable tool 的三层。";
+    el.style.color = "#047857";
+  } else {
+    el.textContent = "再试一次：第一空是产品层会话，第二空是 core 循环，第三空是真正执行工具的方法。";
+    el.style.color = "#b91c1c";
+  }
+}
+</script>
+</body>
+</html>

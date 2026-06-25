@@ -1,0 +1,40 @@
+# pi 项目中的提示词（System Prompt & User Prompt）组装速查
+
+在 pi 中，提示词并不是一个简单的硬编码静态字符串，而是根据当前环境（活动工具、项目上下文、Skills、自定义模板）动态组装而成的。
+
+## 1. System Prompt（系统提示词）组装核心
+
+核心逻辑在：[`packages/coding-agent/src/core/system-prompt.ts`](../packages/coding-agent/src/core/system-prompt.ts)
+入口函数：`buildSystemPrompt(options: BuildSystemPromptOptions)`
+
+其拼装顺序如下（非自定义时）：
+
+| 序号 | 模块 | 拼装来源 | 目的 |
+|---|---|---|---|
+| **1** | **Base Identity** | 默认硬编码字符串 | 确立 `pi` 专家编码助手的身份和可用工具说明。 |
+| **2** | **Available Tools** | `options.selectedTools` & `toolSnippets` | 渲染出一个可用工具列表。**只有当工具在 selectedTools 中且拥有 snippet 描述时才会显示**。 |
+| **3** | **Guidelines** | `promptGuidelines` 基础项 & 追加项 | 本地环境约束规则（例如：“Be concise”、“Use bash for file operations” 等）。 |
+| **4** | **Documentation** | 本地 `docs/`、`examples/` 的绝对路径 | 注入 Pi 自身框架相关的 markdown 路径，防止 LLM 在需要写扩展/调试 pi 时产生幻觉。 |
+| **5** | **Append Text** | `options.appendSystemPrompt` | 用户自定义追加的内容。 |
+| **6** | **Project Context** | `<project_context>` 标签包围 | 读取项目根目录或配置目录下的局部 `AGENTS.md` / `CONTRIBUTING.md`。 |
+| **7** | **Skills** | `<skill>` 标签包围 | 读取 `~/.pi/skills/` 下加载激活的 Markdown Skill 块。 |
+| **8** | **CWD & Date** | `date` 和本地 `cwd` | 在最底部注入当前日期和运行目录，以便模型绝对路径计算。 |
+
+---
+
+## 2. User Prompt（用户提示词）组装与替换
+
+核心逻辑在：[`packages/coding-agent/src/core/prompt-templates.ts`](../packages/coding-agent/src/core/prompt-templates.ts)
+入口函数：`expandPromptTemplate(text, templates)` 和 `expandSkillCommand(text)`
+
+用户在 TUI 或命令行提交 `text` 后：
+
+### A. Skill 展开 (`/skill:name args`)
+如果检测到以 `/skill:` 开头，pi 会去 `~/.pi/skills/` 下匹配。
+- 匹配成功，就将完整的 `.md` 文件剥离 frontmatter 后包裹进 `<skill name="...">` 标签作为上下文送给 LLM。
+
+### B. Prompt Template 替换 (`/template_name args`)
+如果检测到以 `/` 开头且不是 skill：
+1. 扫描全局 `~/.pi/prompts/*.md` 和项目 `.pi/prompts/*.md`。
+2. 剥离 frontmatter 得到内容骨架，使用 bash 规范对参数进行解析（`parseCommandArgs` 支持引号）。
+3. 替换占位符（支持 `$1` Positional、`${1:-default}` 默认值、`${@:2}` 切片、`$@` / `$ARGUMENTS` 全量参数）。
