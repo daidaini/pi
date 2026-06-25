@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lesson 0002 · pi 的提示词动态组装机制</title>
+  <link rel="stylesheet" href="../assets/course.css" />
+</head>
+<body>
+<main>
+  <header>
+    <p class="muted">Lesson 0002 · mission: <a href="../MISSION.md">理解 pi 项目中的工具执行，写架构文档</a> · reference: <a href="../reference/prompt-assembly.html">提示词组装速查</a></p>
+    <h1>提示词的动态拼装机制：系统约束与用户模板</h1>
+    <p class="lede">本节目标：理解 pi 中 System Prompt 如何多模块拼接、Project Context 怎么融入，以及用户 `/` 命令如何转成 LLM 提示词。</p>
+    <div class="goal">
+      <strong>本节完成后你应该能：</strong>
+      <ul>
+        <li>列出默认 System Prompt 拼装的 8 个主要模块和先后顺序。</li>
+        <li>解释 CWD、Date、Project Context 在 System Prompt 中起什么作用。</li>
+        <li>阐明用户输入 <code>/foo arg1 "arg 2"</code> 时如何被解析和替换。</li>
+      </ul>
+    </div>
+  </header>
+
+  <h2>1. 系统提示词：八重拼装</h2>
+  <p>打开 <a href="../packages/coding-agent/src/core/system-prompt.ts"><code>packages/coding-agent/src/core/system-prompt.ts</code></a> 的 <code>buildSystemPrompt</code> 函数，你会发现它的主要职责就是组装字符串。在<b>没有</b>启用 <code>customPrompt</code>（即正常使用 pi 预设）时，它的拼装链条非常工整：</p>
+
+  <div class="callout">
+    <ol>
+      <li><strong>助手基本人设</strong>：固定前导句，说明自己是在 <code>pi</code> 里面的专家。</li>
+      <li><strong>工具列表</strong>：基于 <code>selectedTools</code>，将工具名字和 <code>toolSnippets</code> 里的简短一句话介绍组合。注意：如果工具没有在 <code>toolSnippets</code> 中注册一句话介绍，它就不会出现在 <code>Available tools</code> 列表中（但仍可调用）。</li>
+      <li><strong>操作指引（Guidelines）</strong>：组合默认规范和 <code>promptGuidelines</code>，去重。例如：<code>Be concise</code>、<code>Show file paths clearly</code> 等。</li>
+      <li><strong>pi 自家开发文档路径</strong>：在末尾注入 <code>README.md</code>、<code>docs/</code>、<code>examples/</code> 的绝对路径，并重点交代“遇到 pi 本身开发任务时去这里读”。这是 pi 框架开发如此智能的核心秘诀之一！</li>
+      <li><strong>自定义追加内容</strong>：拼入 <code>appendSystemPrompt</code>。</li>
+      <li><strong>项目特定上下文（Project Context）</strong>：如果工作目录中有 <code>AGENTS.md</code> 等文件，会读出来，包在 <code>&lt;project_context&gt;</code> 标签里送给 LLM，实现“一项目一规则”。</li>
+      <li><strong>Skills 块（技能集）</strong>：如果可用工具有 <code>read</code> 且加载了 Skills，格式化后包在 <code>&lt;skill&gt;</code> 标签里追加进去。</li>
+      <li><strong>当前时空信标</strong>：最底部加入 <code>Current date</code> 和当前绝对 <code>Current working directory</code>。由于模型不知道当前现实时间和目录，这一步对于它在执行 `write`/`edit` 相对路径时极其重要。</li>
+    </ol>
+  </div>
+
+  <h2>2. 源码导览：核心函数剖析</h2>
+
+  <h3>A. 标签式多文件包装</h3>
+  <p>在 <code>buildSystemPrompt</code> 中，项目级 AGENTS 规则是以如下结构加入提示词的：</p>
+  <pre><code>// Append project context files
+if (contextFiles.length &gt; 0) {
+	prompt += "\n\n&lt;project_context&gt;\n\n";
+	prompt += "Project-specific instructions and guidelines:\n\n";
+	for (const { path: filePath, content } of contextFiles) {
+		prompt += `&lt;project_instructions path="${filePath}"&gt;\n${content}\n&lt;/project_instructions&gt;\n\n`;
+	}
+	prompt += "&lt;/project_context&gt;\n";
+}</code></pre>
+  <p>这种 XML 标签格式能最大程度减少模型定位规则的偏移，非常契合 Claude 等模型的长上下文指令遵循特性。</p>
+
+  <h3>B. 用户模板展开 (Prompt Template)</h3>
+  <p>当用户在会话框中输入 <code>/foo arg1 "arg 2"</code>，这并不是一个斜杠命令，而是模板展开！</p>
+  <p>打开 <a href="../packages/coding-agent/src/core/prompt-templates.ts"><code>packages/coding-agent/src/core/prompt-templates.ts</code></a> 的 <code>expandPromptTemplate</code>：</p>
+  <ol>
+    <li>如果文本以 <code>/</code> 开头，通过正则 <code>/^\/([^\s]+)(?:\s+([\s\S]*))?$/</code> 提取模板名 <code>foo</code> 和参数串 <code>arg1 "arg 2"</code>。</li>
+    <li>去 <code>templates</code> 数组（由 global / project prompts 扫描而来）里寻找名字匹配 <code>foo</code> 的模板文件（如 <code>foo.md</code>）。</li>
+    <li>通过 <code>parseCommandArgs</code> 拆分参数。这个解析器非常讲究，它用 <code>inQuote</code> 变量实现了对双引号/单引号括起来的参数不因空格截断的支持（例如 <code>"arg 2"</code> 仍被当作一个参数）。</li>
+    <li>调用 <code>substituteArgs</code>，通过正则批量替换骨架内容：
+      <ul>
+        <li><code>$1</code> 替换成第一个参数 <code>arg1</code></li>
+        <li><code>${2:-default}</code> 替换成第二个参数，若不存在则使用 <code>default</code> 默认值</li>
+        <li><code>$@</code> 或 <code>$ARGUMENTS</code> 替换成全量参数</li>
+        <li>支持 bash 样式的参数切片 <code>${@:2}</code>（代表从第 2 个参数开始往后的所有参数）。</li>
+      </ul>
+    </li>
+  </ol>
+
+  <h2>3. 交互巩固：参数替换小测验</h2>
+  <div class="quiz">
+    <p>假设项目本地定义了如下模板 <code>.pi/prompts/test.md</code>：</p>
+    <pre><code>Please inspect ${1:-src/index.ts} and look for pattern "$2". Full parameters: $@</code></pre>
+    <p>当你在输入框输入：<br/><code>/test "package.json" "dependency"</code><br/>时，最终送入模型的 User Prompt 会是什么？（请复制最终渲染出的整行文字填入下方）</p>
+    <input id="q1" aria-label="输入替换结果" placeholder="Please inspect..." />
+    <button onclick="check()">验证</button>
+    <p id="feedback"></p>
+  </div>
+
+  <h2>4. 思考与追问</h2>
+  <p>我们在第一节学过，<code>AgentSession.prompt()</code> 是用户输入的入口。在 <code>prompt()</code> 执行时，它在什么位置调用这些展开逻辑？</p>
+  <details>
+    <summary>看看 <code>AgentSession.prompt()</code> 里的时序</summary>
+    <pre><code>// 1. 如果是 extension 命令行，立即在本地消费执行（不经过 LLM）
+if (expandPromptTemplates &amp;&amp; text.startsWith("/")) {
+	const handled = await this._tryExecuteExtensionCommand(text);
+	if (handled) return;
+}
+
+// 2. 触发 extension "input" 事件，允许 extension 拦截、改写 text 或 images
+if (this._extensionRunner.hasHandlers("input")) { ... }
+
+// 3. 此时才真正做展开 (Skill 展开 &amp; Template 展开)
+let expandedText = currentText;
+if (expandPromptTemplates) {
+	expandedText = this._expandSkillCommand(expandedText);
+	expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+}
+
+// 4. 发送给 Agent 之前的 before_agent_start 事件，允许 extension 修改最终 systemPrompt
+const result = await this._extensionRunner.emitBeforeAgentStart(expandedText, ...);</code></pre>
+  </details>
+
+  <p class="mini">提示：任何时候都可以向我提问具体的代码行，例如 <code>substituteArgs 中的正则捕获组是如何设计的？</code></p>
+
+  <div class="callout check">
+    <p><strong>学完这一节：</strong></p>
+    <p>你已经完全掌握了 pi 中 System Prompt 和 User Prompt 的组装架构。可以开始写学习记录了！</p>
+    <p>请回复：“完成 Lesson 0002”。我会为你生成第二条学习记录并探讨接下来你想深挖的方向。</p>
+  </div>
+</main>
+<script>
+function check() {
+  const input = document.getElementById("q1").value.trim();
+  const expected = 'Please inspect package.json and look for pattern "dependency". Full parameters: package.json dependency';
+  const el = document.getElementById("feedback");
+  if (input === expected) {
+    el.textContent = "完全正确！连引号和 $@ 拼接都完全一致。";
+    el.style.color = "var(--green)";
+  } else {
+    el.textContent = "答案不太对，仔细对照模板和替换规则：引号保留，$@ 中没有引号，用空格隔开。目标是：" + expected;
+    el.style.color = "var(--red)";
+  }
+}
+</script>
+</body>
+</html>
