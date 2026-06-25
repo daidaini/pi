@@ -39,3 +39,9 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+<<<<<<< HEAD
+=======
+.pi/skills/
+
+learning*/
+>>>>>>> 9a601574 (update docs)
