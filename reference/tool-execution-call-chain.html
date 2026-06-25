@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pi 工具执行调用链速查</title>
+  <style>
+    :root { --ink:#111827; --muted:#6b7280; --line:#d1d5db; --bg:#ffffff; --soft:#f8fafc; --accent:#1d4ed8; --code:#0f172a; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 ui-serif, Georgia, "Noto Serif SC", serif; }
+    main { max-width:980px; margin:48px auto; padding:0 24px 64px; }
+    h1 { font-size:34px; line-height:1.1; margin:0 0 8px; letter-spacing:-.02em; }
+    h2 { margin-top:36px; padding-top:18px; border-top:1px solid var(--line); font-size:22px; }
+    h3 { margin-top:22px; font-size:17px; }
+    p, li { max-width:76ch; }
+    a { color:var(--accent); text-decoration-thickness:1px; text-underline-offset:3px; }
+    code { font-family:ui-monospace, SFMono-Regular, Consolas, monospace; font-size:.92em; color:var(--code); background:#eef2ff; padding:.08em .28em; border-radius:4px; }
+    .muted { color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+    .card { border:1px solid var(--line); border-radius:14px; padding:16px 18px; background:var(--soft); }
+    .flow { display:grid; gap:10px; margin:20px 0; }
+    .step { border:1px solid var(--line); border-left:5px solid var(--accent); border-radius:10px; padding:12px 14px; background:white; }
+    .step strong { display:block; font-size:15px; }
+    .arrow { text-align:center; color:var(--muted); font-family:ui-monospace, monospace; }
+    table { border-collapse:collapse; width:100%; margin:16px 0; font-size:15px; }
+    th, td { border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; vertical-align:top; }
+    th { font-family:ui-sans-serif, system-ui, sans-serif; font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+    .print-note { font-size:14px; color:var(--muted); }
+    @media print { body { font-size:12pt; } main { margin:0; max-width:none; } a { color:black; } .card, .step { break-inside:avoid; } }
+    @media (max-width:760px) { .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <p class="muted">Reference · links: <a href="../lessons/0001-tool-execution-call-chain.html">Lesson 0001</a> · <a href="../MISSION.md">MISSION.md</a></p>
+  <h1>pi 工具执行调用链速查</h1>
+  <p>核心分界：<strong>模型决定是否产生 <code>toolCall</code></strong>；本地 <strong>agent loop 只负责校验、执行、发事件、把 <code>toolResult</code> 放回上下文</strong>。</p>
+
+  <h2>一句话模型</h2>
+  <div class="flow" aria-label="工具执行主调用链">
+    <div class="step"><strong>1. 工具被注册并选中</strong><code>AgentSession</code> 构造 tool registry，active tools 写入 <code>agent.state.tools</code>，system prompt 同步重建。</div>
+    <div class="arrow">↓</div>
+    <div class="step"><strong>2. 用户 prompt 进入 session</strong><code>AgentSession.prompt()</code> 做命令、模板、鉴权、扩展事件，然后调用 <code>agent.prompt()</code>。</div>
+    <div class="arrow">↓</div>
+    <div class="step"><strong>3. LLM 请求带上工具 schema</strong><code>streamAssistantResponse()</code> 构造 <code>Context</code>，其中 <code>tools: context.tools</code>。</div>
+    <div class="arrow">↓</div>
+    <div class="step"><strong>4. 模型流式产出 toolCall</strong>provider stream 发 <code>toolcall_start/delta/end</code>，UI 可先看到参数逐步成形。</div>
+    <div class="arrow">↓</div>
+    <div class="step"><strong>5. assistant message 结束后执行工具</strong><code>executeToolCalls()</code> 收集 <code>toolCall</code>，按 parallel/sequential 执行。</div>
+    <div class="arrow">↓</div>
+    <div class="step"><strong>6. 单个工具执行</strong>找工具 → <code>prepareArguments</code> → <code>validateToolArguments</code> → <code>beforeToolCall</code> → <code>tool.execute()</code> → <code>afterToolCall</code>。</div>
+    <div class="arrow">↓</div>
+    <div class="step"><strong>7. 结果变成消息并回到模型上下文</strong>发 <code>tool_execution_end</code>，创建 <code>ToolResultMessage</code>，追加到 <code>currentContext.messages</code>，下一轮 LLM 读取结果。</div>
+  </div>
+
+  <h2>关键文件地图</h2>
+  <table>
+    <thead><tr><th>层</th><th>文件</th><th>你要看什么</th></tr></thead>
+    <tbody>
+      <tr><td>AI 边界</td><td><a href="../packages/ai/src/types.ts"><code>packages/ai/src/types.ts</code></a></td><td><code>Tool</code> 是给模型看的 schema；<code>ToolCall</code> 是模型输出；<code>ToolResultMessage</code> 是执行结果。</td></tr>
+      <tr><td>Core agent</td><td><a href="../packages/agent/src/agent-loop.ts"><code>packages/agent/src/agent-loop.ts</code></a></td><td>工具执行主循环：stream assistant、execute tools、append tool results、continue turn。</td></tr>
+      <tr><td>Core types</td><td><a href="../packages/agent/src/types.ts"><code>packages/agent/src/types.ts</code></a></td><td><code>AgentTool</code> 比 AI 层 <code>Tool</code> 多 <code>label</code>、<code>execute</code>、<code>executionMode</code>。</td></tr>
+      <tr><td>Product session</td><td><a href="../packages/coding-agent/src/core/agent-session.ts"><code>packages/coding-agent/src/core/agent-session.ts</code></a></td><td>工具 registry、active tools、system prompt、extension hook、事件持久化。</td></tr>
+      <tr><td>Built-ins</td><td><a href="../packages/coding-agent/src/core/tools/index.ts"><code>packages/coding-agent/src/core/tools/index.ts</code></a></td><td>内置工具定义和实例入口。</td></tr>
+      <tr><td>Adapter</td><td><a href="../packages/coding-agent/src/core/tools/tool-definition-wrapper.ts"><code>tool-definition-wrapper.ts</code></a></td><td>把 product 层 <code>ToolDefinition</code> 包成 core 层 <code>AgentTool</code>。</td></tr>
+      <tr><td>TUI</td><td><a href="../packages/coding-agent/src/modes/interactive/interactive-mode.ts"><code>interactive-mode.ts</code></a></td><td>订阅事件；遇到 tool call/update/end 时创建或更新 <code>ToolExecutionComponent</code>。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>事件顺序速记</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>无工具</h3>
+      <p><code>agent_start → turn_start → user message_start/end → assistant message_start/update/end → turn_end → agent_end</code></p>
+    </div>
+    <div class="card">
+      <h3>有工具</h3>
+      <p><code>assistant message_end → tool_execution_start → tool_execution_update* → tool_execution_end → toolResult message_start/end → turn_end → next turn</code></p>
+    </div>
+  </div>
+
+  <h2>常见误解</h2>
+  <ul>
+    <li><strong>不是本地代码主动“选择”工具。</strong> 本地代码暴露 active tools；模型根据 prompt、schema、上下文输出 <code>toolCall</code>。</li>
+    <li><strong>工具结果不是直接展示完就结束。</strong> 它会变成 <code>toolResult</code> 消息，进入下一次 LLM 请求。</li>
+    <li><strong>TUI 看到的 tool row 不等于工具已经执行。</strong> <code>message_update</code> 里出现 <code>toolCall</code> 时，UI 可以先画 pending row；真正执行从 <code>tool_execution_start</code> 开始。</li>
+    <li><strong>parallel 模式仍保留消息顺序。</strong> completion event 可按完成顺序出现，但最终 <code>toolResult</code> 消息按 assistant 源顺序发出。</li>
+  </ul>
+
+  <p class="print-note">打印建议：横向或 A4，保留链接。后续 lesson 会在这张速查图上加 provider 转换和 extension hook 细节。</p>
+</main>
+</body>
+</html>
